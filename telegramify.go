@@ -24,6 +24,16 @@ import (
 	"github.com/yuin/goldmark/text"
 )
 
+// md is shared across calls; a goldmark.Markdown is safe for concurrent use.
+var md = goldmark.New(
+	goldmark.WithExtensions(
+		extension.Table,
+		extension.Strikethrough,
+		extension.TaskList,
+		spoilerExt,
+	),
+)
+
 // Markdownify converts a Markdown string into Telegram MarkdownV2.
 //
 // The result is safe to send to the Telegram Bot API with
@@ -34,15 +44,6 @@ func Markdownify(markdown string, opts ...Option) string {
 	for _, opt := range opts {
 		opt(cfg)
 	}
-
-	md := goldmark.New(
-		goldmark.WithExtensions(
-			extension.Table,
-			extension.Strikethrough,
-			extension.TaskList,
-			spoilerExt,
-		),
-	)
 
 	src := []byte(markdown)
 	doc := md.Parser().Parse(text.NewReader(src))

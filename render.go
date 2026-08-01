@@ -15,6 +15,10 @@ import (
 type renderer struct {
 	cfg    *config
 	source []byte
+	// inItalic / inBold track open emphasis entities: Telegram cannot nest
+	// entities of the same type, so redundant inner markers are dropped.
+	inItalic bool
+	inBold   bool
 }
 
 // render renders the document node and returns the trimmed MarkdownV2 output.
@@ -74,7 +78,7 @@ func (r *renderer) renderHeading(n *ast.Heading) string {
 	}
 	prefix := ""
 	if s := r.cfg.headingSymbols[level-1]; s != "" {
-		prefix = s + " "
+		prefix = escapeText(s) + " "
 	}
 	if strings.TrimSpace(content) == "" {
 		return strings.TrimSpace(prefix)
@@ -83,6 +87,11 @@ func (r *renderer) renderHeading(n *ast.Heading) string {
 	switch {
 	case level <= 2:
 		open, close = "*__", "__*" // bold + underline
+		if strings.HasSuffix(content, "_") {
+			// Telegram matches __ greedily; \r disambiguates an italic close
+			// immediately followed by the underline close.
+			close = "\r__*"
+		}
 	case level <= 4:
 		open, close = "*", "*" // bold
 	default:
@@ -102,7 +111,13 @@ func (r *renderer) renderInlineChildren(n ast.Node) string {
 func (r *renderer) renderInline(n ast.Node) string {
 	switch n := n.(type) {
 	case *ast.Text:
-		s := escapeText(string(n.Value(r.source)))
+		value := n.Value(r.source)
+		var s string
+		if n.IsRaw() {
+			s = escapeText(string(value))
+		} else {
+			s = escapeText(resolveRawText(value))
+		}
 		if n.HardLineBreak() || n.SoftLineBreak() {
 			s += "\n"
 		}
@@ -110,11 +125,22 @@ func (r *renderer) renderInline(n ast.Node) string {
 	case *ast.String:
 		return escapeText(string(n.Value))
 	case *ast.Emphasis:
-		marker := "_" // level 1: italic
-		if n.Level >= 2 {
-			marker = "*" // level 2: bold
+		if n.Level >= 2 { // bold
+			if r.inBold {
+				return r.renderInlineChildren(n)
+			}
+			r.inBold = true
+			s := "*" + r.renderInlineChildren(n) + "*"
+			r.inBold = false
+			return s
 		}
-		return marker + r.renderInlineChildren(n) + marker
+		if r.inItalic {
+			return r.renderInlineChildren(n)
+		}
+		r.inItalic = true
+		s := "_" + r.renderInlineChildren(n) + "_"
+		r.inItalic = false
+		return s
 	case *east.Strikethrough:
 		return "~" + r.renderInlineChildren(n) + "~"
 	case *spoilerNode:
@@ -125,14 +151,18 @@ func (r *renderer) renderInline(n ast.Node) string {
 		return r.renderLink(string(n.Destination), r.renderInlineChildren(n))
 	case *ast.AutoLink:
 		url := string(n.URL(r.source))
-		return r.renderLink(url, escapeText(url))
+		dest := url
+		if n.AutoLinkType == ast.AutoLinkEmail && !strings.HasPrefix(dest, "mailto:") {
+			dest = "mailto:" + dest
+		}
+		return r.renderLink(dest, escapeText(url))
 	case *ast.Image:
 		return r.renderImage(n)
 	case *east.TaskCheckBox:
 		if n.IsChecked {
-			return r.cfg.taskDone + " "
+			return escapeText(r.cfg.taskDone) + " "
 		}
-		return r.cfg.taskTodo + " "
+		return escapeText(r.cfg.taskTodo) + " "
 	case *ast.RawHTML:
 		return escapeText(r.rawHTMLText(n))
 	default:
@@ -154,7 +184,7 @@ func (r *renderer) renderImage(n *ast.Image) string {
 	if strings.HasPrefix(dest, "tg://emoji") {
 		return "![" + alt + "](" + escapeURL(dest) + ")"
 	}
-	label := r.cfg.imageSymbol
+	label := escapeText(r.cfg.imageSymbol)
 	if strings.TrimSpace(alt) != "" {
 		if label != "" {
 			label += " " + alt
@@ -169,7 +199,9 @@ func (r *renderer) renderImage(n *ast.Image) string {
 }
 
 func (r *renderer) renderCode(lang string, n ast.Node) string {
-	code := strings.TrimRight(r.linesText(n), "\n")
+	// Trim only the structural newline of the last line; further trailing
+	// blank lines are code content.
+	code := strings.TrimSuffix(r.linesText(n), "\n")
 	var b strings.Builder
 	b.WriteString("```")
 	b.WriteString(escapeCode(lang))
@@ -180,7 +212,7 @@ func (r *renderer) renderCode(lang string, n ast.Node) string {
 }
 
 func (r *renderer) renderBlockquote(n *ast.Blockquote, depth int) string {
-	content := r.renderBlocks(n, depth)
+	content := r.renderQuoteBlocks(n, depth)
 	lines := strings.Split(content, "\n")
 	expandable := r.cfg.citeExpandable && utf16Len(content) > r.cfg.expandableThreshold
 	var b strings.Builder
@@ -201,6 +233,25 @@ func (r *renderer) renderBlockquote(n *ast.Blockquote, depth int) string {
 	return b.String()
 }
 
+// renderQuoteBlocks renders blockquote children, flattening nested
+// blockquotes into the parent: Telegram forbids nested blockquote entities.
+func (r *renderer) renderQuoteBlocks(parent ast.Node, depth int) string {
+	var parts []string
+	for c := parent.FirstChild(); c != nil; c = c.NextSibling() {
+		var s string
+		if bq, ok := c.(*ast.Blockquote); ok {
+			s = r.renderQuoteBlocks(bq, depth)
+		} else {
+			s = r.renderBlock(c, depth)
+		}
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
 func (r *renderer) renderList(n *ast.List, depth int) string {
 	indent := strings.Repeat("  ", depth)
 	var lines []string
@@ -213,48 +264,71 @@ func (r *renderer) renderList(n *ast.List, depth int) string {
 		if !ok {
 			continue
 		}
-		var marker string
+		var marker, visibleMarker string
 		switch {
 		case n.IsOrdered():
-			marker = escapeText(strconv.Itoa(index)+".") + " "
+			raw := strconv.Itoa(index) + "."
+			marker = escapeText(raw) + " "
+			visibleMarker = raw + " "
 			index++
 		case itemHasTaskCheckbox(item):
-			marker = "" // the rendered checkbox symbol acts as the marker
+			// The rendered checkbox symbol acts as the marker.
 		default:
 			marker = escapeText(r.cfg.unorderedMarker) + " "
+			visibleMarker = r.cfg.unorderedMarker + " "
 		}
 
-		var textBlocks []string
-		var nested []string
+		// Continuation lines align under the visible marker width, which
+		// excludes escape backslashes Telegram strips when rendering.
+		cont := indent + strings.Repeat(" ", utf8.RuneCountInString(visibleMarker))
+		first := true
 		for ic := item.FirstChild(); ic != nil; ic = ic.NextSibling() {
 			if lst, ok := ic.(*ast.List); ok {
-				nested = append(nested, r.renderList(lst, depth+1))
+				if s := r.renderList(lst, depth+1); strings.TrimSpace(s) != "" {
+					lines = append(lines, strings.Split(s, "\n")...)
+					first = false
+				}
 				continue
 			}
-			if s := r.renderBlock(ic, depth); strings.TrimSpace(s) != "" {
-				textBlocks = append(textBlocks, s)
+			s := r.renderBlock(ic, depth)
+			if strings.TrimSpace(s) == "" {
+				continue
+			}
+			if _, isQuote := ic.(*ast.Blockquote); isQuote {
+				// Telegram only recognises '>' at the start of a line, so a
+				// blockquote cannot be indented into the item.
+				lines = append(lines, strings.Split(s, "\n")...)
+				first = false
+				continue
+			}
+			for _, line := range strings.Split(s, "\n") {
+				if first {
+					lines = append(lines, indent+marker+line)
+					first = false
+				} else {
+					lines = append(lines, cont+line)
+				}
 			}
 		}
-
-		cont := indent + strings.Repeat(" ", utf8.RuneCountInString(marker))
-		for i, line := range strings.Split(strings.Join(textBlocks, "\n"), "\n") {
-			if i == 0 {
-				lines = append(lines, indent+marker+line)
-			} else {
-				lines = append(lines, cont+line)
-			}
+		if first { // empty item
+			lines = append(lines, indent+strings.TrimRight(marker, " "))
 		}
-		lines = append(lines, nested...)
 	}
 	return strings.Join(lines, "\n")
 }
 
 func (r *renderer) renderTable(n *east.Table) string {
-	var rows [][]string
+	// Widths and padding are computed on the raw text (what Telegram shows
+	// after stripping escapes); the escaped text is what gets written.
+	type tableCell struct {
+		raw, escaped string
+	}
+	var rows [][]tableCell
 	for rowNode := n.FirstChild(); rowNode != nil; rowNode = rowNode.NextSibling() {
-		var cells []string
+		var cells []tableCell
 		for cellNode := rowNode.FirstChild(); cellNode != nil; cellNode = cellNode.NextSibling() {
-			cells = append(cells, escapeCode(r.plainInline(cellNode)))
+			raw := r.plainInline(cellNode)
+			cells = append(cells, tableCell{raw: raw, escaped: escapeCode(raw)})
 		}
 		rows = append(rows, cells)
 	}
@@ -270,7 +344,7 @@ func (r *renderer) renderTable(n *east.Table) string {
 	widths := make([]int, ncol)
 	for _, row := range rows {
 		for i, cell := range row {
-			if w := utf8.RuneCountInString(cell); w > widths[i] {
+			if w := utf8.RuneCountInString(cell.raw); w > widths[i] {
 				widths[i] = w
 			}
 		}
@@ -281,13 +355,13 @@ func (r *renderer) renderTable(n *east.Table) string {
 	for ri, row := range rows {
 		b.WriteByte('|')
 		for i := 0; i < ncol; i++ {
-			cell := ""
+			var cell tableCell
 			if i < len(row) {
 				cell = row[i]
 			}
-			pad := widths[i] - utf8.RuneCountInString(cell)
+			pad := widths[i] - utf8.RuneCountInString(cell.raw)
 			b.WriteByte(' ')
-			b.WriteString(cell)
+			b.WriteString(cell.escaped)
 			b.WriteString(strings.Repeat(" ", pad))
 			b.WriteString(" |")
 		}
@@ -326,7 +400,14 @@ func (r *renderer) codeSpanText(n *ast.CodeSpan) string {
 	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
 		switch t := c.(type) {
 		case *ast.Text:
-			b.Write(t.Segment.Value(r.source))
+			v := t.Segment.Value(r.source)
+			// CommonMark: line endings inside a code span become spaces.
+			if len(v) > 0 && v[len(v)-1] == '\n' {
+				b.Write(v[:len(v)-1])
+				b.WriteByte(' ')
+			} else {
+				b.Write(v)
+			}
 		case *ast.String:
 			b.Write(t.Value)
 		}
@@ -366,7 +447,11 @@ func (r *renderer) plainInline(n ast.Node) string {
 		}
 		switch t := node.(type) {
 		case *ast.Text:
-			b.Write(t.Value(r.source))
+			if t.IsRaw() {
+				b.Write(t.Value(r.source))
+			} else {
+				b.WriteString(resolveRawText(t.Value(r.source)))
+			}
 			if t.SoftLineBreak() || t.HardLineBreak() {
 				b.WriteByte(' ')
 			}

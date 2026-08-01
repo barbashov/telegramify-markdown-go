@@ -64,6 +64,123 @@ func TestSplitDefaultLimit(t *testing.T) {
 	}
 }
 
+// Split must not drop blank lines at chunk boundaries.
+func TestSplitKeepsBlankLinesAtBoundaries(t *testing.T) {
+	got := Split("abc\n\nx", 3)
+	want := []string{"abc", "\nx"}
+	if len(got) != len(want) {
+		t.Fatalf("got %#v want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %#v want %#v", got, want)
+		}
+	}
+}
+
+func TestSplitLosslessAcrossParagraphs(t *testing.T) {
+	in := "para one\n\npara two\n\npara three"
+	parts := Split(in, 10)
+	if len(parts) < 2 {
+		t.Fatalf("expected multiple chunks, got %#v", parts)
+	}
+	if got := strings.Join(parts, "\n"); got != in {
+		t.Errorf("rejoined chunks lost content\n got: %q\nwant: %q", got, in)
+	}
+}
+
+// A fenced code block that fits in a chunk is kept atomic.
+func TestSplitKeepsFenceAtomic(t *testing.T) {
+	parts := Split("12345\n\n```\na\n```", 10)
+	want := []string{"12345\n", "```\na\n```"}
+	if len(parts) != len(want) {
+		t.Fatalf("got %#v want %#v", parts, want)
+	}
+	for i := range want {
+		if parts[i] != want[i] {
+			t.Fatalf("got %#v want %#v", parts, want)
+		}
+	}
+}
+
+// An oversized fenced block is split with the fence closed and reopened
+// (including the language) so every chunk is valid MarkdownV2.
+func TestSplitReopensOversizedFence(t *testing.T) {
+	in := "```go\nline one is long\nline two is long\nline three\n```"
+	parts := Split(in, 30)
+	want := []string{
+		"```go\nline one is long\n```",
+		"```go\nline two is long\n```",
+		"```go\nline three\n```",
+	}
+	if len(parts) != len(want) {
+		t.Fatalf("got %#v want %#v", parts, want)
+	}
+	for i := range want {
+		if parts[i] != want[i] {
+			t.Fatalf("chunk %d: got %q want %q", i, parts[i], want[i])
+		}
+		if utf16Len(parts[i]) > 30 {
+			t.Errorf("chunk %d exceeds limit: %d", i, utf16Len(parts[i]))
+		}
+	}
+}
+
+// Every chunk of a mixed document has balanced code fences.
+func TestSplitChunksHaveBalancedFences(t *testing.T) {
+	var sb strings.Builder
+	for i := 0; i < 10; i++ {
+		sb.WriteString("some paragraph text here\n\n```python\ncode line a\ncode line b\n```\n\n")
+	}
+	parts := Split(strings.TrimSpace(sb.String()), 60)
+	for i, p := range parts {
+		fences := 0
+		for _, line := range strings.Split(p, "\n") {
+			if strings.HasPrefix(line, "```") {
+				fences++
+			}
+		}
+		if fences%2 != 0 {
+			t.Errorf("chunk %d has unbalanced fences (%d):\n%q", i, fences, p)
+		}
+	}
+}
+
+// Hard-splitting never separates a backslash from its escaped character.
+func TestSplitLongLineKeepsEscapePairs(t *testing.T) {
+	// An odd limit would land a boundary in the middle of an escape pair.
+	parts := Split(strings.Repeat(`\.`, 10), 3)
+	want := []string{`\.`, `\.`, `\.`, `\.`, `\.`, `\.`, `\.`, `\.`, `\.`, `\.`}
+	if len(parts) != len(want) {
+		t.Fatalf("got %#v want %#v", parts, want)
+	}
+	for i := range want {
+		if parts[i] != want[i] {
+			t.Fatalf("got %#v want %#v", parts, want)
+		}
+	}
+	for i, p := range parts {
+		if strings.HasSuffix(p, `\`) && !strings.HasSuffix(p, `\\`) {
+			t.Errorf("chunk %d ends with a dangling backslash: %q", i, p)
+		}
+	}
+}
+
+// A limit smaller than one rune's UTF-16 width cannot be honored; the rune
+// is emitted whole and reassembly stays lossless (documented behavior).
+func TestSplitTinyLimitAstralRune(t *testing.T) {
+	in := strings.Repeat("😀", 3)
+	parts := Split(in, 1)
+	if strings.Join(parts, "") != in {
+		t.Errorf("astral reassembly mismatch: %#v", parts)
+	}
+	for _, p := range parts {
+		if p == "" {
+			t.Errorf("empty chunk emitted")
+		}
+	}
+}
+
 func TestSplitAstralNotBroken(t *testing.T) {
 	// Each 😀 is 2 UTF-16 units; a limit that is odd must not split a rune.
 	limit := 5

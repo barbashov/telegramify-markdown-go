@@ -62,9 +62,12 @@ bot.Send(msg)
 ## Splitting long messages
 
 Telegram rejects messages longer than 4096 UTF-16 code units. `Split` breaks a
-rendered string into chunks that each fit, cutting at newline boundaries so
-markup is not broken across chunks (as long as each block is itself under the
-limit):
+rendered string into chunks that each fit, cutting at newline boundaries.
+Fenced code blocks are kept intact when they fit within the limit; an
+oversized block is closed at the chunk boundary and reopened (with its
+language) in the next chunk, so each chunk stays valid MarkdownV2. Other
+multi-line entities (emphasis spanning a line break, blockquotes) are not
+reopened across chunks — keep such blocks under the limit:
 
 ```go
 out := telegramify.Markdownify(longText)

@@ -175,7 +175,8 @@ func TestMarkdownifyOptions(t *testing.T) {
 
 	t.Run("custom task symbols", func(t *testing.T) {
 		got := Markdownify("- [x] done", WithTaskSymbols("[DONE]", "[TODO]"))
-		want := "[DONE] done"
+		// The symbols are display text, so MarkdownV2 specials must be escaped.
+		want := "\\[DONE\\] done"
 		if got != want {
 			t.Errorf("got %q want %q", got, want)
 		}
