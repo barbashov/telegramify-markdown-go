@@ -100,6 +100,33 @@ func TestCodeSpanNewlineBecomesSpace(t *testing.T) {
 	}
 }
 
+// Inline raw HTML is rendered as escaped literal text.
+func TestInlineRawHTMLEscaped(t *testing.T) {
+	got := Markdownify("text <br> more")
+	want := "text <br\\> more"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+// Table cells reduce code spans and autolinks to their plain text.
+func TestTableCellsWithCodeSpanAndAutolink(t *testing.T) {
+	got := Markdownify("| `code.x` | link |\n|---|---|\n| <https://e.com> | y |")
+	want := "```\n| code.x        | link |\n|---------------|------|\n| https://e.com | y    |\n```"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+// An empty list item still renders its marker.
+func TestEmptyListItem(t *testing.T) {
+	got := Markdownify("- a\n-\n- b")
+	want := "• a\n•\n• b"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
 // Table alignment must use visible (unescaped) cell widths.
 func TestTableAlignmentUsesVisibleWidth(t *testing.T) {
 	got := Markdownify("| a\\z | bb |\n|---|----|\n| c | d |")

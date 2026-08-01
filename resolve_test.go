@@ -36,7 +36,11 @@ func TestResolveRawText(t *testing.T) {
 		{"&amp;", "&"},
 		{"&#65;", "A"},
 		{"&#x41;", "A"},
-		{"&#0;", "�"}, // invalid code point -> replacement char
+		{"&#X41;", "A"}, // uppercase hex marker
+		{"&#x4A;", "J"}, // hex digit A-F
+		{"&#x4a;", "J"}, // hex digit a-f
+		{"&#xFF;", "ÿ"}, // uppercase hex digits
+		{"&#0;", "�"},   // invalid code point -> replacement char
 		{"&notanentity;", "&notanentity;"},
 		{"&missingsemicolon", "&missingsemicolon"},
 		{"plain", "plain"},

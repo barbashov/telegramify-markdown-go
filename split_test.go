@@ -146,6 +146,31 @@ func TestSplitChunksHaveBalancedFences(t *testing.T) {
 	}
 }
 
+// A single code line longer than the limit is hard-split, with every
+// resulting chunk still opened and closed as a fence.
+func TestSplitFenceWithOverlongLine(t *testing.T) {
+	code := strings.Repeat("x", 50)
+	in := "```\n" + code + "\n```"
+	limit := 20
+	parts := Split(in, limit)
+	if len(parts) < 3 {
+		t.Fatalf("expected several chunks, got %#v", parts)
+	}
+	var rejoined strings.Builder
+	for i, p := range parts {
+		if utf16Len(p) > limit {
+			t.Errorf("chunk %d exceeds limit: %d", i, utf16Len(p))
+		}
+		if !strings.HasPrefix(p, "```\n") || !strings.HasSuffix(p, "\n```") {
+			t.Errorf("chunk %d is not a complete fence: %q", i, p)
+		}
+		rejoined.WriteString(strings.TrimSuffix(strings.TrimPrefix(p, "```\n"), "\n```"))
+	}
+	if rejoined.String() != code {
+		t.Errorf("code content lost: got %q want %q", rejoined.String(), code)
+	}
+}
+
 // Hard-splitting never separates a backslash from its escaped character.
 func TestSplitLongLineKeepsEscapePairs(t *testing.T) {
 	// An odd limit would land a boundary in the middle of an escape pair.

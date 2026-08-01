@@ -173,6 +173,23 @@ func TestMarkdownifyOptions(t *testing.T) {
 		}
 	})
 
+	t.Run("custom horizontal rule", func(t *testing.T) {
+		got := Markdownify("---", WithHorizontalRule("***"))
+		// The rule is display text, so MarkdownV2 specials are escaped.
+		want := "\\*\\*\\*"
+		if got != want {
+			t.Errorf("got %q want %q", got, want)
+		}
+	})
+
+	t.Run("custom expandable threshold", func(t *testing.T) {
+		got := Markdownify("> hello world here", WithExpandableThreshold(5))
+		want := "**>hello world here||"
+		if got != want {
+			t.Errorf("got %q want %q", got, want)
+		}
+	})
+
 	t.Run("custom task symbols", func(t *testing.T) {
 		got := Markdownify("- [x] done", WithTaskSymbols("[DONE]", "[TODO]"))
 		// The symbols are display text, so MarkdownV2 specials must be escaped.
