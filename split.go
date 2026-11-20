@@ -5,24 +5,21 @@ import "strings"
 // DefaultMaxLength is Telegram's maximum message length in UTF-16 code units.
 const DefaultMaxLength = 4096
 
-// Split breaks text into chunks that each fit within limit UTF-16 code units
-// (the unit Telegram measures message length in). If limit is <= 0,
-// DefaultMaxLength is used.
-//
-// Splitting happens at newline boundaries. Fenced code blocks are kept intact
-// when they fit within the limit; an oversized block is split by closing the
-// fence at the chunk boundary and reopening it (with its language) in the
-// next chunk, so every chunk remains valid MarkdownV2. Other multi-line
-// entities (e.g. emphasis spanning a line break, blockquotes) are not
-// reopened across chunks — keep such blocks below the limit to avoid broken
-// markup.
-//
-// A single line longer than the limit is hard-split at rune boundaries,
-// keeping backslash escape pairs together. A chunk may exceed the limit only
-// when it is impossible to stay within it: a limit smaller than one rune's
-// UTF-16 width (e.g. limit 1 with an emoji) or smaller than one escape pair.
-// Chunks consisting solely of whitespace are dropped.
+// Split breaks Telegram MarkdownV2 into independently sendable chunks.
+// The limit applies to visible UTF-16 units. Escape pairs and runes stay intact.
 func Split(text string, limit int) []string {
+	if !strings.ContainsAny(text, "_*[`~|>") && !strings.Contains(text, "\\") {
+		return splitPlain(text, limit)
+	}
+	chunks := splitMarkup(text, limit)
+	var parts []string
+	for _, chunk := range chunks {
+		parts = append(parts, chunk.MarkdownV2)
+	}
+	return parts
+}
+
+func splitPlain(text string, limit int) []string {
 	if limit <= 0 {
 		limit = DefaultMaxLength
 	}
@@ -34,39 +31,11 @@ func Split(text string, limit int) []string {
 	}
 
 	s := &splitter{limit: limit}
-	lines := strings.Split(text, "\n")
-	for i := 0; i < len(lines); i++ {
-		line := lines[i]
-		if strings.HasPrefix(line, "```") {
-			end := -1
-			for j := i + 1; j < len(lines); j++ {
-				if isClosingFence(lines[j]) {
-					end = j
-					break
-				}
-			}
-			if end >= 0 {
-				block := strings.Join(lines[i:end+1], "\n")
-				if bl := utf16Len(block); bl <= limit {
-					s.addAtomic(block, bl)
-				} else {
-					s.addFencedBlock(lines[i:end+1], line)
-				}
-				i = end
-				continue
-			}
-			// Unterminated fence: fall through to plain line handling.
-		}
+	for _, line := range strings.Split(text, "\n") {
 		s.addLine(line)
 	}
 	s.flush()
 	return s.chunks
-}
-
-// isClosingFence reports whether line consists solely of three or more
-// backticks.
-func isClosingFence(line string) bool {
-	return len(line) >= 3 && strings.TrimLeft(line, "`") == ""
 }
 
 // splitter accumulates lines into chunks of at most limit UTF-16 code units.
@@ -94,15 +63,14 @@ func (s *splitter) addLine(line string) {
 	lineLen := utf16Len(line)
 	if lineLen > s.limit {
 		s.flush()
-		s.chunks = append(s.chunks, splitLongLine(line, s.limit)...)
+		for _, p := range splitLongLine(line, s.limit) {
+			if strings.TrimSpace(p) != "" {
+				s.chunks = append(s.chunks, p)
+			}
+		}
 		return
 	}
 	s.append(line, lineLen)
-}
-
-// addAtomic appends a multi-line block that must not be split.
-func (s *splitter) addAtomic(block string, blockLen int) {
-	s.append(block, blockLen)
 }
 
 func (s *splitter) append(part string, partLen int) {
@@ -121,49 +89,6 @@ func (s *splitter) append(part string, partLen int) {
 	s.cur.WriteString(part)
 	s.curLen += partLen
 	s.started = true
-}
-
-// addFencedBlock splits a fenced code block that exceeds the limit on its
-// own. Each emitted chunk is opened with the original fence line (including
-// the language) and closed with ```, so every chunk parses as a complete
-// code block.
-func (s *splitter) addFencedBlock(lines []string, opener string) {
-	s.flush()
-	const closing = "\n```"
-	openLen := utf16Len(opener)
-	closeLen := utf16Len(closing)
-
-	s.cur.WriteString(opener)
-	s.curLen = openLen
-	s.started = true
-	for _, line := range lines[1 : len(lines)-1] {
-		pieces := []string{line}
-		if lineLen := utf16Len(line); openLen+1+lineLen+closeLen > s.limit {
-			avail := s.limit - openLen - 1 - closeLen
-			if avail < 1 {
-				avail = 1
-			}
-			pieces = splitLongLine(line, avail)
-		}
-		for _, piece := range pieces {
-			pieceLen := utf16Len(piece)
-			if s.curLen+1+pieceLen+closeLen > s.limit {
-				s.cur.WriteString(closing)
-				s.chunks = append(s.chunks, s.cur.String())
-				s.cur.Reset()
-				s.cur.WriteString(opener)
-				s.curLen = openLen
-			}
-			s.cur.WriteByte('\n')
-			s.cur.WriteString(piece)
-			s.curLen += 1 + pieceLen
-		}
-	}
-	s.cur.WriteString(closing)
-	s.chunks = append(s.chunks, s.cur.String())
-	s.cur.Reset()
-	s.curLen = 0
-	s.started = false
 }
 
 // splitLongLine hard-splits a single line into pieces of at most limit UTF-16

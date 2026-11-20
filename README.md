@@ -61,26 +61,20 @@ bot.Send(msg)
 
 ## Splitting long messages
 
-Telegram rejects messages longer than 4096 UTF-16 code units. `Split` breaks a
-rendered string into chunks that each fit, cutting at newline boundaries.
-Fenced code blocks are kept intact when they fit within the limit; an
-oversized block is closed at the chunk boundary and reopened (with its
-language) in the next chunk, so each chunk stays valid MarkdownV2. Other
-multi-line entities (emphasis spanning a line break, blockquotes) are not
-reopened across chunks — keep such blocks under the limit:
+Telegram limits the visible text of a message to 4096 characters.
+`Split` counts visible UTF-16 units conservatively and keeps formatting
+balanced across chunks. `RenderChunks` also provides the plain text of each
+chunk so callers can retry a failed formatting request without markup.
 
 ```go
-out := telegramify.Markdownify(longText)
-for _, chunk := range telegramify.Split(out, telegramify.DefaultMaxLength) {
-	msg := tgbotapi.NewMessage(chatID, chunk)
+for _, chunk := range telegramify.RenderChunks(longText, telegramify.DefaultMaxLength) {
+	msg := tgbotapi.NewMessage(chatID, chunk.MarkdownV2)
 	msg.ParseMode = tgbotapi.ModeMarkdownV2
 	bot.Send(msg)
 }
 ```
 
-`Split` measures length in **UTF-16 code units** — the same unit Telegram uses —
-so emoji and other astral-plane characters are counted correctly and never cut
-mid-rune.
+A limit of 1 cannot fit an astral rune. In that case the rune stays intact.
 
 ## Supported Markdown
 

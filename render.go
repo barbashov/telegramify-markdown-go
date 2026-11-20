@@ -1,6 +1,7 @@
 package telegramify
 
 import (
+	"net/url"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -68,7 +69,6 @@ func (r *renderer) renderBlock(n ast.Node, depth int) string {
 }
 
 func (r *renderer) renderHeading(n *ast.Heading) string {
-	content := r.renderInlineChildren(n)
 	level := n.Level
 	if level < 1 {
 		level = 1
@@ -76,6 +76,10 @@ func (r *renderer) renderHeading(n *ast.Heading) string {
 	if level > 6 {
 		level = 6
 	}
+	oldBold, oldItalic := r.inBold, r.inItalic
+	r.inBold, r.inItalic = level <= 4, level >= 5
+	content := r.renderInlineChildren(n)
+	r.inBold, r.inItalic = oldBold, oldItalic
 	prefix := ""
 	if s := r.cfg.headingSymbols[level-1]; s != "" {
 		prefix = escapeText(s) + " "
@@ -148,7 +152,8 @@ func (r *renderer) renderInline(n ast.Node) string {
 	case *ast.CodeSpan:
 		return "`" + escapeCode(r.codeSpanText(n)) + "`"
 	case *ast.Link:
-		return r.renderLink(string(n.Destination), r.renderInlineChildren(n))
+		return r.renderLink(resolveRawText(n.Destination), r.renderLinkLabel(n))
+
 	case *ast.AutoLink:
 		url := string(n.URL(r.source))
 		dest := url
@@ -177,11 +182,26 @@ func (r *renderer) renderLink(dest, text string) string {
 	return "[" + text + "](" + escapeURL(dest) + ")"
 }
 
+func (r *renderer) renderLinkLabel(n ast.Node) string {
+	var label strings.Builder
+	for child := n.FirstChild(); child != nil; child = child.NextSibling() {
+		if img, ok := child.(*ast.Image); ok {
+			label.WriteString(r.renderInlineChildren(img))
+		} else {
+			label.WriteString(r.renderInline(child))
+		}
+	}
+	return label.String()
+}
+
 func (r *renderer) renderImage(n *ast.Image) string {
-	dest := string(n.Destination)
+	dest := resolveRawText(n.Destination)
 	alt := r.renderInlineChildren(n)
 	// Telegram custom emoji are written with image syntax; keep it intact.
-	if strings.HasPrefix(dest, "tg://emoji") {
+	if u, err := url.Parse(dest); err == nil && u.Scheme == "tg" && u.Host == "emoji" {
+		if id, err := strconv.ParseUint(u.Query().Get("id"), 10, 64); err != nil || id == 0 || strings.TrimSpace(alt) == "" {
+			return alt
+		}
 		return "![" + alt + "](" + escapeURL(dest) + ")"
 	}
 	label := escapeText(r.cfg.imageSymbol)
@@ -213,24 +233,40 @@ func (r *renderer) renderCode(lang string, n ast.Node) string {
 
 func (r *renderer) renderBlockquote(n *ast.Blockquote, depth int) string {
 	content := r.renderQuoteBlocks(n, depth)
+	var parts, prose []string
+	flush := func() {
+		if len(prose) == 0 {
+			return
+		}
+		expandable := r.cfg.citeExpandable && utf16Len(strings.Join(prose, "\n")) > r.cfg.expandableThreshold
+		quote := ">" + strings.Join(prose, "\n>")
+		if expandable {
+			quote = "**" + quote + "||"
+		}
+		parts = append(parts, quote)
+		prose = nil
+	}
 	lines := strings.Split(content, "\n")
-	expandable := r.cfg.citeExpandable && utf16Len(content) > r.cfg.expandableThreshold
-	var b strings.Builder
-	for i, line := range lines {
-		if i > 0 {
-			b.WriteByte('\n')
+	for i := 0; i < len(lines); i++ {
+		end := -1
+		if strings.HasPrefix(strings.TrimSpace(lines[i]), "```") {
+			for j := i + 1; j < len(lines); j++ {
+				if strings.TrimSpace(lines[j]) == "```" {
+					end = j
+					break
+				}
+			}
 		}
-		if i == 0 && expandable {
-			b.WriteString("**>")
+		if end >= 0 {
+			flush()
+			parts = append(parts, strings.Join(lines[i:end+1], "\n"))
+			i = end
 		} else {
-			b.WriteByte('>')
+			prose = append(prose, lines[i])
 		}
-		b.WriteString(line)
 	}
-	if expandable {
-		b.WriteString("||")
-	}
-	return b.String()
+	flush()
+	return strings.Join(parts, "\n\n")
 }
 
 // renderQuoteBlocks renders blockquote children, flattening nested
@@ -256,9 +292,7 @@ func (r *renderer) renderList(n *ast.List, depth int) string {
 	indent := strings.Repeat("  ", depth)
 	var lines []string
 	index := n.Start
-	if index == 0 {
-		index = 1
-	}
+
 	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
 		item, ok := c.(*ast.ListItem)
 		if !ok {
@@ -294,13 +328,14 @@ func (r *renderer) renderList(n *ast.List, depth int) string {
 			if strings.TrimSpace(s) == "" {
 				continue
 			}
-			if _, isQuote := ic.(*ast.Blockquote); isQuote {
-				// Telegram only recognises '>' at the start of a line, so a
-				// blockquote cannot be indented into the item.
+			switch ic.(type) {
+			case *ast.Blockquote, *ast.FencedCodeBlock, *ast.CodeBlock, *east.Table:
+				// Keep Telegram block delimiters at the start of the line.
 				lines = append(lines, strings.Split(s, "\n")...)
 				first = false
 				continue
 			}
+
 			for _, line := range strings.Split(s, "\n") {
 				if first {
 					lines = append(lines, indent+marker+line)
@@ -403,7 +438,7 @@ func (r *renderer) codeSpanText(n *ast.CodeSpan) string {
 			v := t.Segment.Value(r.source)
 			// CommonMark: line endings inside a code span become spaces.
 			if len(v) > 0 && v[len(v)-1] == '\n' {
-				b.Write(v[:len(v)-1])
+				b.WriteString(strings.TrimSuffix(string(v[:len(v)-1]), "\r"))
 				b.WriteByte(' ')
 			} else {
 				b.Write(v)
